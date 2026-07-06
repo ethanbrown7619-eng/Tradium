@@ -45,6 +45,14 @@ celery_app.conf.beat_schedule = {
         "task": "app.worker.poll_open_orders_task",
         "schedule": 5.0,  # Every 5 seconds — fills must be reconciled quickly
     },
+    "settle-positions": {
+        "task": "app.worker.settle_positions_task",
+        "schedule": 300.0,  # Every 5 minutes — resolve settled markets into realized P&L
+    },
+    "reconcile-orders": {
+        "task": "app.worker.reconcile_orders_task",
+        "schedule": 120.0,  # Every 2 minutes — cancel crash-orphaned venue orders
+    },
 }
 
 
@@ -59,12 +67,55 @@ def _run_async(coro):
 
 @celery_app.task(name="app.worker.scan_markets_task", bind=True, max_retries=1)
 def scan_markets_task(self):
-    """Main market scanning task."""
+    """Main market scanning task, guarded so cycles can't overlap and double-fire."""
+    import redis as redis_lib
+    r = redis_lib.from_url(settings.redis_url)
+    # Only one scan cycle at a time: a slow cycle must not overlap the next beat.
+    got_lock = r.set("tradium:scan:lock", "1", nx=True, ex=60)
+    if not got_lock:
+        return  # previous scan still running
     try:
         from app.bot.scanner import run_scan_cycle
         _run_async(run_scan_cycle())
     except Exception as e:
         self.retry(exc=e, countdown=5)
+    finally:
+        try:
+            r.delete("tradium:scan:lock")
+        except Exception:
+            pass
+
+
+@celery_app.task(name="app.worker.reconcile_orders_task")
+def reconcile_orders_task():
+    """Cancel venue orders the DB doesn't know about (crash-orphans)."""
+    async def _rec():
+        from app.database.session import async_session
+        from app.database import queries
+        from app.services.clob import ClobOrderClient
+        from app.services.encryption import decrypt_private_key
+        from app.bot.reconcile import reconcile_orphan_orders
+
+        oc = ClobOrderClient()
+        async with async_session() as db:
+            cache: dict = {}
+
+            async def resolve_key(user_id):
+                if user_id in cache:
+                    return cache[user_id]
+                cfg = await queries.get_user_config(db, user_id)
+                key = None
+                if cfg and cfg.encrypted_private_key:
+                    try:
+                        key = decrypt_private_key(cfg.encrypted_private_key)
+                    except ValueError:
+                        key = None
+                cache[user_id] = key
+                return key
+
+            return await reconcile_orphan_orders(db, oc, resolve_key)
+
+    _run_async(_rec())
 
 
 @celery_app.task(name="app.worker.poll_open_orders_task")
@@ -97,6 +148,21 @@ def poll_open_orders_task():
             return await monitor_open_orders(db, order_client, resolve_key)
 
     _run_async(_poll())
+
+
+@celery_app.task(name="app.worker.settle_positions_task")
+def settle_positions_task():
+    """Resolve settled markets into realized P&L so the daily-loss stop is real."""
+    async def _settle():
+        from app.database.session import async_session
+        from app.services.polymarket import PolymarketService
+        from app.bot.settlement import settle_resolved_positions
+
+        pm = PolymarketService()
+        async with async_session() as db:
+            return await settle_resolved_positions(db, pm.get_market_resolution)
+
+    _run_async(_settle())
 
 
 @celery_app.task(name="app.worker.daily_summary_task")

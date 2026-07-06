@@ -230,6 +230,32 @@ async def get_open_order_trades(session: AsyncSession, limit: int = 500) -> list
     return list(result.scalars().all())
 
 
+async def get_unsettled_filled_trades(session: AsyncSession, limit: int = 1000) -> list[Trade]:
+    """Live, filled trades not yet settled — candidates for settlement P&L."""
+    result = await session.execute(
+        select(Trade)
+        .where(and_(
+            Trade.is_paper == False,  # noqa: E712
+            Trade.status == "filled",
+            Trade.settled_at.is_(None),
+            Trade.strategy_type.in_(["binary", "multi_outcome", "strategy"]),
+        ))
+        .order_by(Trade.executed_at)
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def mark_trades_settled(session: AsyncSession, trade_ids: list) -> int:
+    if not trade_ids:
+        return 0
+    result = await session.execute(
+        update(Trade).where(Trade.id.in_(trade_ids)).values(settled_at=func.now())
+    )
+    await session.commit()
+    return result.rowcount
+
+
 async def update_trade_fill(
     session: AsyncSession, trade_id: UUID, status: str,
     filled_size: Optional[float] = None, fill_price: Optional[float] = None,
@@ -250,6 +276,22 @@ async def update_trade_fill(
     await session.commit()
     await session.refresh(trade)
     return trade
+
+
+async def get_known_order_ids(session: AsyncSession, user_id: UUID) -> set:
+    """All CLOB order IDs the DB knows about for a user (for orphan reconciliation)."""
+    result = await session.execute(
+        select(Trade.order_id).where(and_(Trade.user_id == user_id, Trade.order_id.isnot(None)))
+    )
+    return {row[0] for row in result.all() if row[0]}
+
+
+async def get_wallet_user_ids(session: AsyncSession) -> list:
+    """User IDs that have a wallet configured (candidates for order reconciliation)."""
+    result = await session.execute(
+        select(UserConfig.user_id).where(UserConfig.encrypted_private_key.isnot(None))
+    )
+    return [row[0] for row in result.all()]
 
 
 async def get_trades_for_opportunity(session: AsyncSession, opportunity_id: UUID) -> list[Trade]:

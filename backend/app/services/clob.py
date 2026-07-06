@@ -142,6 +142,24 @@ class ClobOrderClient:
         client.cancel_all()
         return True
 
+    async def get_open_orders(self, private_key: str) -> list:
+        """Return the user's currently open orders on the venue as [{order_id}]."""
+        try:
+            return await asyncio.to_thread(self._get_open_orders_sync, private_key)
+        except Exception as e:
+            logger.error(f"CLOB get_open_orders failed: {e}")
+            return []
+
+    def _get_open_orders_sync(self, private_key) -> list:
+        client = self._get_client(private_key)
+        orders = client.get_orders()
+        out = []
+        for o in (orders or []):
+            oid = o.get("id") or o.get("order_id") or o.get("orderID")
+            if oid:
+                out.append({"order_id": str(oid)})
+        return out
+
     async def get_order(self, private_key: str, order_id: str) -> OrderResult:
         try:
             return await asyncio.to_thread(self._get_order_sync, private_key, order_id)

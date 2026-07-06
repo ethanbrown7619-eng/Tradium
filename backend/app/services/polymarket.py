@@ -35,6 +35,9 @@ class PolymarketService:
         self.settings = get_settings()
         self.gamma_url = self.settings.polymarket_gamma_url
         self.clob_url = self.settings.polymarket_api_url
+        # Keep CLOB API usage under limits (shared across this service instance)
+        from app.services.ratelimit import AsyncRateLimiter
+        self._rate_limiter = AsyncRateLimiter(max_calls=8, period=1.0)
 
     async def get_markets(
         self,
@@ -205,6 +208,29 @@ class PolymarketService:
             "raw": raw,
         }
 
+    async def get_market_resolution(self, condition_id: str) -> dict:
+        """
+        Check whether a market has resolved and which token won.
+        Returns {"resolved": bool, "winning_token_id": str|None}.
+        A CLOB market is resolved when it is closed and one token has winner=True.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(f"{self.clob_url}/markets/{condition_id}")
+                resp.raise_for_status()
+                m = resp.json()
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to fetch resolution for {condition_id}: {e}")
+            return {"resolved": False, "winning_token_id": None}
+
+        closed = bool(m.get("closed", False))
+        winning_token_id = None
+        for t in m.get("tokens", []):
+            if t.get("winner"):
+                winning_token_id = str(t.get("token_id"))
+                break
+        return {"resolved": closed and winning_token_id is not None, "winning_token_id": winning_token_id}
+
     async def get_order_book(self, token_id: str) -> Optional[dict]:
         """Fetch order book from Polymarket CLOB API for a given token."""
         try:
@@ -220,11 +246,12 @@ class PolymarketService:
             return None
 
     async def get_order_books_batch(self, token_ids: list[str]) -> dict[str, dict]:
-        """Fetch order books for multiple tokens."""
+        """Fetch order books for multiple tokens, rate-limited to stay under CLOB limits."""
         results = {}
         async with httpx.AsyncClient(timeout=15) as client:
             for token_id in token_ids:
                 try:
+                    await self._rate_limiter.acquire()
                     resp = await client.get(
                         f"{self.clob_url}/book",
                         params={"token_id": token_id},
