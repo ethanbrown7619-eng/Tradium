@@ -426,6 +426,122 @@ class ExecutionEngine:
             trades=[{"id": str(t.id), "side": t.side, "status": t.status} for t in trades],
         )
 
+    async def execute_strategy_intent(
+        self,
+        db: AsyncSession,
+        user_id: UUID,
+        config: UserConfig,
+        intent,  # engine.StrategyIntent
+        opportunity_id: UUID,
+    ) -> ExecutionResult:
+        """
+        Execute a single-leg strategy intent (buy to open / sell to close).
+        Reuses the SAME claim + risk-limit spine as arbitrage — strategy mode is
+        not a parallel execution path; it just produces different intents.
+        """
+        settings = config.settings
+        is_paper = settings.get("paper_trading", True)
+
+        claimed = await queries.claim_opportunity(db, opportunity_id, "queued", "executing")
+        if not claimed:
+            return ExecutionResult(success=False, trades=[], error="Opportunity already claimed")
+
+        is_buy = intent.side == "buy"
+        notional = intent.target_qty * intent.limit_price
+
+        # Buys deploy new capital -> full risk gate. Sells only reduce exposure,
+        # so they must still honor the kill switch but not the capital/budget caps.
+        if is_buy:
+            risk_error = await self.check_risk_limits(db, user_id, config, notional)
+        else:
+            risk_error = None if settings.get("bot_active", False) else "Bot is not active (kill switch may be engaged)"
+        if risk_error:
+            await queries.update_opportunity_status(db, opportunity_id, "failed")
+            return ExecutionResult(success=False, trades=[], error=risk_error)
+
+        strategy_uuid = None
+        if getattr(intent, "strategy_id", None):
+            try:
+                strategy_uuid = UUID(str(intent.strategy_id))
+            except (ValueError, TypeError):
+                strategy_uuid = None
+
+        # Realized P&L only exists when closing against a known average entry.
+        profit_loss = 0.0
+        if not is_buy:
+            positions = await queries.get_open_positions(db, user_id, strategy_id=strategy_uuid)
+            pos = positions.get(intent.token_id)
+            if pos:
+                close_qty = min(intent.target_qty, pos["qty"])
+                profit_loss = (intent.limit_price - pos["avg_entry_price"]) * close_qty
+
+        signed_qty = intent.target_qty if is_buy else -intent.target_qty
+        now = datetime.now(timezone.utc)
+
+        if is_paper:
+            trade = await queries.create_trade(
+                db,
+                user_id=user_id,
+                opportunity_id=opportunity_id,
+                market_id=intent.market_id,
+                condition_id=intent.condition_id,
+                token_id=intent.token_id,
+                strategy_id=strategy_uuid,
+                strategy_type="strategy",
+                side=f"{intent.side}:{intent.outcome}",
+                size_usdc=Decimal(str(notional)),
+                fill_price=Decimal(str(intent.limit_price)),
+                filled_size=Decimal(str(signed_qty)),
+                fees_paid=Decimal("0"),
+                profit_loss=Decimal(str(profit_loss)),
+                status="filled",
+                is_paper=True,
+                price_snapshot={"reason": intent.reason, "side": intent.side, "token_id": intent.token_id},
+            )
+            await queries.update_opportunity_status(db, opportunity_id, "executed", executed_at=now)
+            logger.info(
+                f"[PAPER] Strategy {intent.reason}: {intent.side} {intent.target_qty:.2f} "
+                f"{intent.outcome}@{intent.limit_price:.4f} (${notional:.2f})"
+            )
+        else:
+            try:
+                private_key = decrypt_private_key(config.encrypted_private_key)
+                order_result = await self._place_outcome_order(
+                    private_key=private_key,
+                    condition_id=intent.condition_id,
+                    outcome=intent.outcome,
+                    price=intent.limit_price,
+                    shares=intent.target_qty,
+                )
+                trade = await queries.create_trade(
+                    db,
+                    user_id=user_id,
+                    opportunity_id=opportunity_id,
+                    market_id=intent.market_id,
+                    condition_id=intent.condition_id,
+                    token_id=intent.token_id,
+                    strategy_id=strategy_uuid,
+                    strategy_type="strategy",
+                    side=f"{intent.side}:{intent.outcome}",
+                    size_usdc=Decimal(str(notional)),
+                    fill_price=Decimal(str(intent.limit_price)),
+                    status="submitted",
+                    is_paper=False,
+                    order_id=order_result.get("order_id"),
+                    tx_hash=order_result.get("tx_hash"),
+                    price_snapshot={"reason": intent.reason, "side": intent.side, "token_id": intent.token_id},
+                )
+                await queries.update_opportunity_status(db, opportunity_id, "executed", executed_at=now)
+            except Exception as e:
+                logger.error(f"Failed to execute strategy intent: {e}")
+                await queries.update_opportunity_status(db, opportunity_id, "failed")
+                return ExecutionResult(success=False, trades=[], error=str(e))
+
+        return ExecutionResult(
+            success=True,
+            trades=[{"id": str(trade.id), "side": trade.side, "status": trade.status}],
+        )
+
     async def _place_binary_orders(
         self, private_key: str, condition_id: str, prices: dict[str, float], shares: float,
     ) -> dict[str, dict]:

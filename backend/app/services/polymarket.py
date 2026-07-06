@@ -107,10 +107,13 @@ class PolymarketService:
                     if not page:
                         break
                     markets.extend(page)
-                    cursor = body.get("next_cursor", "") if isinstance(body, dict) else ""
-                    # CLOB signals end-of-list with the sentinel cursor "LTE="
-                    if not cursor or cursor == "LTE=":
+                    next_cursor = body.get("next_cursor", "") if isinstance(body, dict) else ""
+                    # Stop on ANY end condition: the documented sentinel "LTE=" (base64
+                    # for -1), a missing/empty cursor, OR a cursor that didn't advance
+                    # (loop guard — terminates safely even if the API misbehaves).
+                    if not next_cursor or next_cursor == "LTE=" or next_cursor == cursor:
                         break
+                    cursor = next_cursor
         except httpx.HTTPError as e:
             logger.error(f"Failed to fetch CLOB markets: {e}")
         return markets[:max_markets]
@@ -306,6 +309,17 @@ class PolymarketService:
             return None
         # Asks should be sorted ascending; best ask = lowest price
         return min(float(a["price"]) for a in asks)
+
+    @staticmethod
+    def get_best_bid_price(order_book: dict) -> Optional[float]:
+        """Get the best (highest) bid price from order book."""
+        if not order_book:
+            return None
+        bids = order_book.get("bids", [])
+        if not bids:
+            return None
+        # Best bid = highest price someone will pay
+        return max(float(b["price"]) for b in bids)
 
     @staticmethod
     def get_fillable_price(order_book: dict, side: str, size_usdc: float) -> Optional[float]:

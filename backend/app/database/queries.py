@@ -5,7 +5,7 @@ from uuid import UUID
 from typing import Optional
 from decimal import Decimal
 
-from app.database.schema import User, UserConfig, Opportunity, Trade, MarketCache
+from app.database.schema import User, UserConfig, Opportunity, Trade, MarketCache, Strategy
 
 
 # ── User queries ──
@@ -263,3 +263,85 @@ async def get_cached_markets(session: AsyncSession, max_age_seconds: int = 300) 
         select(MarketCache).where(MarketCache.cached_at >= cutoff)
     )
     return list(result.scalars().all())
+
+
+# ── Strategy queries ──
+
+async def create_strategy(session: AsyncSession, user_id: UUID, name: str, definition: dict, enabled: bool = False) -> Strategy:
+    strat = Strategy(user_id=user_id, name=name, definition=definition, enabled=enabled)
+    session.add(strat)
+    await session.commit()
+    await session.refresh(strat)
+    return strat
+
+
+async def get_strategies(session: AsyncSession, user_id: UUID, enabled_only: bool = False) -> list[Strategy]:
+    q = select(Strategy).where(Strategy.user_id == user_id)
+    if enabled_only:
+        q = q.where(Strategy.enabled == True)  # noqa: E712
+    q = q.order_by(desc(Strategy.created_at))
+    result = await session.execute(q)
+    return list(result.scalars().all())
+
+
+async def get_strategy(session: AsyncSession, strategy_id: UUID) -> Optional[Strategy]:
+    result = await session.execute(select(Strategy).where(Strategy.id == strategy_id))
+    return result.scalar_one_or_none()
+
+
+async def update_strategy(session: AsyncSession, strategy_id: UUID, **kwargs) -> Optional[Strategy]:
+    strat = await get_strategy(session, strategy_id)
+    if strat:
+        for k, v in kwargs.items():
+            setattr(strat, k, v)
+        await session.commit()
+        await session.refresh(strat)
+    return strat
+
+
+async def delete_strategy(session: AsyncSession, strategy_id: UUID) -> bool:
+    result = await session.execute(delete(Strategy).where(Strategy.id == strategy_id))
+    await session.commit()
+    return result.rowcount > 0
+
+
+async def get_open_positions(session: AsyncSession, user_id: UUID, strategy_id: Optional[UUID] = None) -> dict:
+    """
+    Aggregate strategy trades into net positions per token_id.
+
+    Uses average-cost accounting over BUY fills; SELL fills reduce net quantity.
+    Returns {token_id: {"qty": float, "avg_entry_price": float}} for tokens with
+    a positive net quantity. Only strategy_type='strategy' trades are counted.
+    """
+    q = select(Trade).where(and_(Trade.user_id == user_id, Trade.strategy_type == "strategy"))
+    if strategy_id is not None:
+        q = q.where(Trade.strategy_id == strategy_id)
+    q = q.order_by(Trade.executed_at)
+    result = await session.execute(q)
+    trades = list(result.scalars().all())
+
+    acc: dict = {}  # token_id -> {"qty", "cost"}
+    for t in trades:
+        tid = t.token_id
+        if not tid:
+            continue
+        filled = float(t.filled_size or 0)
+        price = float(t.fill_price or 0)
+        entry = acc.setdefault(tid, {"qty": 0.0, "cost": 0.0})
+        if filled >= 0:  # buy
+            entry["qty"] += filled
+            entry["cost"] += filled * price
+        else:  # sell reduces position at average cost
+            avg = entry["cost"] / entry["qty"] if entry["qty"] > 0 else 0.0
+            sell_qty = min(-filled, entry["qty"])
+            entry["qty"] -= sell_qty
+            entry["cost"] -= sell_qty * avg
+
+    positions = {}
+    for tid, e in acc.items():
+        if e["qty"] > 1e-9:
+            positions[tid] = {
+                "qty": e["qty"],
+                "avg_entry_price": e["cost"] / e["qty"] if e["qty"] > 0 else 0.0,
+            }
+    return positions

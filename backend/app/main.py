@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.database.session import engine
 from app.database.schema import Base
-from app.api.routes import auth, config, trades, markets, wallet
+from app.api.routes import auth, config, trades, markets, wallet, strategies
 from app.websocket import ws_endpoint
 
 
@@ -46,6 +46,7 @@ app.include_router(config.router, prefix="/api")
 app.include_router(trades.router, prefix="/api")
 app.include_router(markets.router, prefix="/api")
 app.include_router(wallet.router, prefix="/api")
+app.include_router(strategies.router, prefix="/api")
 
 # WebSocket
 app.add_api_route("/ws", ws_endpoint, methods=["GET"])

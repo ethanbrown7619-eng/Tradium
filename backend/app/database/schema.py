@@ -109,9 +109,11 @@ class Trade(Base):
     opportunity_id = Column(UUID(as_uuid=True), ForeignKey("opportunities.id", ondelete="SET NULL"), nullable=True)
     market_id = Column(String(255), nullable=False)
     condition_id = Column(String(255), nullable=True)
+    token_id = Column(String(255), nullable=True, index=True)  # for strategy position aggregation
+    strategy_id = Column(UUID(as_uuid=True), nullable=True, index=True)  # links to strategies.id
 
     strategy_type = Column(String(50), nullable=False)
-    side = Column(String(10), nullable=False)  # YES, NO, or outcome name
+    side = Column(String(50), nullable=False)  # YES/NO, outcome name, or "buy:YES"/"sell:NO"
     size_usdc = Column(Numeric(12, 4), nullable=False)
     fill_price = Column(Numeric(10, 6), nullable=True)
     filled_size = Column(Numeric(12, 4), nullable=True)
@@ -149,4 +151,26 @@ class MarketCache(Base):
 
     __table_args__ = (
         Index("ix_markets_cache_cached_at", "cached_at"),
+    )
+
+
+class Strategy(Base):
+    __tablename__ = "strategies"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(200), nullable=False)
+    enabled = Column(Boolean, default=False)
+
+    # The full validated StrategyDefinition (universe, entry/exit/stop AST, sizing,
+    # order spec, cooldown, max_open_positions). Validated at save time against the
+    # engine's indicator whitelist — never executed as code, only interpreted.
+    definition = Column(JSONB, nullable=False)
+
+    last_triggered_at = Column(DateTime(timezone=True), nullable=True)  # cooldown tracking
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("ix_strategies_user_enabled", "user_id", "enabled"),
     )

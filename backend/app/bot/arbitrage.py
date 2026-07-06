@@ -58,8 +58,11 @@ class ArbitrageDetector:
             if any(kw.lower() in question.lower() for kw in excluded_keywords):
                 continue
             if "all" not in categories:
-                tags = [t.lower() for t in m.get("tags", [])]
-                if not any(c.lower() in tags for c in categories):
+                tags = [str(t).lower() for t in m.get("tags", [])]
+                # FAIL OPEN: CLOB markets carry no tags, so an empty tag list must
+                # NOT filter the market out — otherwise any user with a category set
+                # would silently trade nothing. Only exclude when tags exist AND miss.
+                if tags and not any(c.lower() in tags for c in categories):
                     continue
             filtered.append(m)
 
