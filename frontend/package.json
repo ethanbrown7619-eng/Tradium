@@ -8,7 +8,7 @@
     "react-router-dom": "^6.23.1",
     "react-scripts": "5.0.1",
     "typescript": "^5.4.5",
-    "axios": "^1.7.2",
+    "axios": "^1.8.2",
     "recharts": "^2.12.7",
     "socket.io-client": "^4.7.5",
     "zustand": "^4.5.2",

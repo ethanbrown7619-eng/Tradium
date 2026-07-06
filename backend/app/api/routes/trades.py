@@ -39,7 +39,7 @@ async def list_trades(
 
 @router.get("/summary", response_model=TradeSummaryResponse)
 async def trade_summary(
-    period: str = Query(default="all", regex="^(today|week|month|all)$"),
+    period: str = Query(default="all", pattern="^(today|week|month|all)$"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
