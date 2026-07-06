@@ -39,8 +39,10 @@ class ArbitrageDetector:
         excluded_markets = settings.get("excluded_markets", [])
         excluded_keywords = settings.get("excluded_keywords", [])
 
-        # Fetch active markets
-        markets = await self.polymarket.get_markets(limit=200, active_only=True)
+        # Fetch active markets from the CLOB feed, normalized to a stable shape
+        # (real tokens[]/token_id). Gamma's stringified clobTokenIds is why the
+        # old get_markets() path yielded empty token lists and scanned nothing.
+        markets = await self.polymarket.get_active_markets(max_markets=500)
         if not markets:
             logger.warning("No markets fetched from Polymarket")
             return {"binary": [], "multi_outcome": [], "correlated": [], "markets_scanned": 0}

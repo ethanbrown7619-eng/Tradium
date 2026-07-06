@@ -4,11 +4,30 @@ Handles market data fetching, order book retrieval, and USDC balance checks.
 Uses Polymarket's Gamma API for market listings and CLOB API for order books.
 """
 import httpx
+import json
 import logging
 from typing import Optional
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_json_list(value) -> list:
+    """
+    Parse a Gamma field that may be a JSON-encoded string (e.g. clobTokenIds =
+    '["123","456"]') or already a list. Returns [] on anything unparseable.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except (json.JSONDecodeError, ValueError):
+            return []
+    return []
 
 
 class PolymarketService:
@@ -65,6 +84,123 @@ class PolymarketService:
         except httpx.HTTPError as e:
             logger.error(f"Failed to fetch market {market_id}: {e}")
             return None
+
+    async def get_clob_markets(self, max_markets: int = 500) -> list[dict]:
+        """
+        Fetch tradable markets from the CLOB /markets endpoint (cursor-paginated).
+
+        The CLOB endpoint is the source of truth for tradable token IDs: each market
+        carries a `tokens[]` array with real `token_id`/`outcome`. (The Gamma API, by
+        contrast, returns `clobTokenIds` as a JSON-encoded string and camelCase keys —
+        which is why the old scanner, reading `market["tokens"]` off Gamma, saw nothing.)
+        """
+        markets: list[dict] = []
+        cursor = ""
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                while len(markets) < max_markets:
+                    params = {"next_cursor": cursor} if cursor else {}
+                    resp = await client.get(f"{self.clob_url}/markets", params=params)
+                    resp.raise_for_status()
+                    body = resp.json()
+                    page = body.get("data", []) if isinstance(body, dict) else body
+                    if not page:
+                        break
+                    markets.extend(page)
+                    cursor = body.get("next_cursor", "") if isinstance(body, dict) else ""
+                    # CLOB signals end-of-list with the sentinel cursor "LTE="
+                    if not cursor or cursor == "LTE=":
+                        break
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to fetch CLOB markets: {e}")
+        return markets[:max_markets]
+
+    async def get_active_markets(self, max_markets: int = 500) -> list[dict]:
+        """Fetch and normalize active, tradable markets into a stable internal shape."""
+        raw = await self.get_clob_markets(max_markets=max_markets)
+        normalized = []
+        for m in raw:
+            norm = self.normalize_market(m)
+            if norm and norm["active"] and not norm["closed"] and norm["tokens"]:
+                normalized.append(norm)
+        return normalized
+
+    @staticmethod
+    def normalize_market(raw: dict) -> Optional[dict]:
+        """
+        Normalize a market from EITHER the CLOB /markets shape or the Gamma shape
+        into one stable dict the scanner/strategies consume:
+
+            {id, market_id, condition_id, slug, question, tokens:[{token_id, outcome}],
+             tags, category, active, closed, min_tick_size, min_order_size, volume, raw}
+
+        Returns None if the raw record has no usable token IDs.
+        """
+        if not isinstance(raw, dict):
+            return None
+
+        tokens: list[dict] = []
+
+        # ── CLOB native shape: tokens[] already has token_id/outcome ──
+        if isinstance(raw.get("tokens"), list) and raw["tokens"] and isinstance(raw["tokens"][0], dict) \
+                and raw["tokens"][0].get("token_id"):
+            for t in raw["tokens"]:
+                tid = t.get("token_id")
+                if tid:
+                    tokens.append({"token_id": str(tid), "outcome": t.get("outcome", "")})
+            condition_id = raw.get("condition_id") or raw.get("conditionId") or ""
+            market_id = condition_id or raw.get("question_id") or ""
+            slug = raw.get("market_slug") or raw.get("slug") or ""
+            question = raw.get("question") or ""
+            tags = raw.get("tags") or []
+            category = raw.get("category") or ""
+            active = bool(raw.get("active", True))
+            closed = bool(raw.get("closed", False))
+            min_tick = raw.get("minimum_tick_size") or raw.get("min_tick_size")
+            min_size = raw.get("minimum_order_size") or raw.get("min_order_size")
+            volume = float(raw.get("volume") or 0) if raw.get("volume") not in (None, "") else 0.0
+
+        # ── Gamma shape: clobTokenIds + outcomes are JSON-encoded strings ──
+        elif raw.get("clobTokenIds"):
+            token_ids = _parse_json_list(raw.get("clobTokenIds"))
+            outcomes = _parse_json_list(raw.get("outcomes"))
+            for i, tid in enumerate(token_ids):
+                if tid:
+                    outcome = outcomes[i] if i < len(outcomes) else ""
+                    tokens.append({"token_id": str(tid), "outcome": outcome})
+            condition_id = raw.get("conditionId") or raw.get("condition_id") or ""
+            market_id = str(raw.get("id") or condition_id or "")
+            slug = raw.get("slug") or ""
+            question = raw.get("question") or ""
+            tags = raw.get("tags") or []
+            category = raw.get("category") or ""
+            active = bool(raw.get("active", True))
+            closed = bool(raw.get("closed", False))
+            min_tick = raw.get("orderPriceMinTickSize")
+            min_size = raw.get("orderMinSize")
+            volume = float(raw.get("volumeNum") or raw.get("volume") or 0) if raw.get("volumeNum") or raw.get("volume") else 0.0
+        else:
+            return None
+
+        if not tokens:
+            return None
+
+        return {
+            "id": market_id,
+            "market_id": market_id,
+            "condition_id": condition_id,
+            "slug": slug,
+            "question": question,
+            "tokens": tokens,
+            "tags": tags,
+            "category": category,
+            "active": active,
+            "closed": closed,
+            "min_tick_size": float(min_tick) if min_tick not in (None, "") else None,
+            "min_order_size": float(min_size) if min_size not in (None, "") else None,
+            "volume": volume,
+            "raw": raw,
+        }
 
     async def get_order_book(self, token_id: str) -> Optional[dict]:
         """Fetch order book from Polymarket CLOB API for a given token."""

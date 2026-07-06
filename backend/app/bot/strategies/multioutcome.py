@@ -112,19 +112,17 @@ def scan_multi_outcome_markets(
                 all_valid = False
                 break
 
+            # VWAP price for filling the intended size on this outcome. If any
+            # outcome can't fill `min_liquidity`, the whole basket isn't tradeable
+            # (multi-outcome arb requires filling ALL legs simultaneously).
             from app.services.polymarket import PolymarketService
-            ask = PolymarketService.get_best_ask_price(book)
+            ask = PolymarketService.get_fillable_price(book, "buy", min_liquidity)
             if ask is None:
                 all_valid = False
                 break
 
-            liq = PolymarketService.calculate_order_book_depth(book, "asks")
-            if liq < min_liquidity:
-                all_valid = False
-                break
-
             outcome_prices[outcome] = ask
-            outcome_liquidities[outcome] = liq
+            outcome_liquidities[outcome] = min_liquidity
 
         if not all_valid:
             continue

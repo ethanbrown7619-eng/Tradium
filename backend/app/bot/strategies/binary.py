@@ -141,19 +141,16 @@ def scan_binary_markets(markets: list[dict], order_books: dict, min_liquidity: f
         if not yes_book or not no_book:
             continue
 
-        # Get best ask prices
+        # Price at SIZE, not top-of-book. We must be able to actually fill
+        # `min_liquidity` USDC on each leg, and the price that matters is the
+        # volume-weighted average price of walking the book to that size — the
+        # best ask is a lie if only $10 sits there. If either side can't fill the
+        # intended size, there isn't a tradeable arb here.
         from app.services.polymarket import PolymarketService
-        yes_ask = PolymarketService.get_best_ask_price(yes_book)
-        no_ask = PolymarketService.get_best_ask_price(no_book)
+        yes_ask = PolymarketService.get_fillable_price(yes_book, "buy", min_liquidity)
+        no_ask = PolymarketService.get_fillable_price(no_book, "buy", min_liquidity)
 
         if yes_ask is None or no_ask is None:
-            continue
-
-        # Calculate liquidity depth
-        yes_liq = PolymarketService.calculate_order_book_depth(yes_book, "asks")
-        no_liq = PolymarketService.calculate_order_book_depth(no_book, "asks")
-
-        if min(yes_liq, no_liq) < min_liquidity:
             continue
 
         result = calculate_binary_arbitrage(
@@ -163,8 +160,9 @@ def scan_binary_markets(markets: list[dict], order_books: dict, min_liquidity: f
             market_slug=market.get("slug", ""),
             yes_ask=yes_ask,
             no_ask=no_ask,
-            yes_liquidity=yes_liq,
-            no_liquidity=no_liq,
+            # Liquidity is the size we verified is fillable at the VWAP above
+            yes_liquidity=min_liquidity,
+            no_liquidity=min_liquidity,
         )
 
         if result.is_profitable:
