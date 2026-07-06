@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import queries
 from app.services.polymarket import PolymarketService
+from app.bot.executor import compute_leg_sizes, _arb_pnl
 from app.bot.strategies.binary import scan_binary_markets, BinaryArbitrageResult
 from app.bot.strategies.multioutcome import scan_multi_outcome_markets, MultiOutcomeArbitrageResult
 from app.bot.strategies.correlated import detect_correlated_opportunities, CorrelatedOpportunity
@@ -83,7 +84,9 @@ class ArbitrageDetector:
         for r in binary_results:
             if r.net_profit_pct >= min_profit_pct:
                 trade_size = min(settings.get("max_trade_size", 100.0), r.min_liquidity)
-                profit_usdc = r.net_profit * trade_size
+                # Dollar profit for an EQUAL-SHARE position deploying `trade_size` notional
+                shares, _ = compute_leg_sizes({"YES": r.yes_price, "NO": r.no_price}, trade_size)
+                _, _, profit_usdc = _arb_pnl(shares, r.price_sum, r.fee_worst_case, r.gas_cost)
                 if profit_usdc >= min_profit_usdc:
                     opp = await queries.create_opportunity(
                         db,
@@ -108,7 +111,9 @@ class ArbitrageDetector:
         for r in multi_results:
             if r.net_profit_pct >= min_profit_pct:
                 trade_size = min(settings.get("max_trade_size", 100.0), r.min_liquidity)
-                profit_usdc = r.net_profit * trade_size
+                # Dollar profit for an EQUAL-SHARE position deploying `trade_size` notional
+                shares, _ = compute_leg_sizes(dict(r.outcome_prices), trade_size)
+                _, _, profit_usdc = _arb_pnl(shares, r.price_sum, r.fee_worst_case, r.gas_cost)
                 if profit_usdc >= min_profit_usdc:
                     opp = await queries.create_opportunity(
                         db,

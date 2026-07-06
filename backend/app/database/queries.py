@@ -94,6 +94,26 @@ async def update_opportunity_status(
     return opp
 
 
+async def claim_opportunity(
+    session: AsyncSession, opp_id: UUID, expected_status: str = "queued", new_status: str = "executing"
+) -> bool:
+    """
+    Atomically transition an opportunity from expected_status -> new_status.
+
+    Returns True only if THIS caller won the claim (the row was in expected_status
+    and this UPDATE moved it). Overlapping scan cycles racing on the same queued
+    opportunity will see exactly one True; every other caller gets False and must
+    skip execution. This is the guard against double-firing a single opportunity.
+    """
+    result = await session.execute(
+        update(Opportunity)
+        .where(and_(Opportunity.id == opp_id, Opportunity.status == expected_status))
+        .values(status=new_status)
+    )
+    await session.commit()
+    return result.rowcount == 1
+
+
 # ── Trade queries ──
 
 async def create_trade(session: AsyncSession, **kwargs) -> Trade:
