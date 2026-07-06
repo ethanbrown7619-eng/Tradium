@@ -85,8 +85,16 @@ def _arb_pnl(shares: float, price_sum: float, fee_worst_case_per_share: float, g
 
 
 class ExecutionEngine:
-    def __init__(self, polymarket: PolymarketService):
+    def __init__(self, polymarket: PolymarketService, order_client=None):
         self.polymarket = polymarket
+        self._order_client = order_client
+
+    def order_client(self):
+        """Lazily construct the real CLOB client. Never called in paper mode."""
+        if self._order_client is None:
+            from app.services.clob import ClobOrderClient
+            self._order_client = ClobOrderClient()
+        return self._order_client
 
     async def check_risk_limits(self, db: AsyncSession, user_id: UUID, config: UserConfig, trade_size: float) -> Optional[str]:
         """
@@ -173,9 +181,9 @@ class ExecutionEngine:
             await queries.update_opportunity_status(db, opportunity_id, "failed")
             return ExecutionResult(success=False, trades=[], error=risk_error)
 
-        # ── Price re-verification (live only) ──
+        # ── Price re-verification (live only), re-probing VWAP at the fill size ──
         if not is_paper:
-            verify_error = await self._reverify_binary(db, settings, opportunity, opportunity_id)
+            verify_error = await self._reverify_binary(db, settings, opportunity, opportunity_id, total_cost)
             if verify_error:
                 return ExecutionResult(success=False, trades=[], error=verify_error)
 
@@ -220,43 +228,58 @@ class ExecutionEngine:
                 f"shares={shares:.2f} cost=${total_cost:.2f} net=${total_net_profit:.4f}"
             )
         else:
+            private_key = decrypt_private_key(config.encrypted_private_key)
+            token_ids = {"YES": opportunity.yes_token_id, "NO": opportunity.no_token_id}
+            if not token_ids["YES"] or not token_ids["NO"]:
+                await queries.update_opportunity_status(db, opportunity_id, "failed")
+                return ExecutionResult(success=False, trades=[], error="Missing token IDs for live order")
+
+            client = self.order_client()
+            placed = []  # (order_id) for cancellation on failure
             try:
-                private_key = decrypt_private_key(config.encrypted_private_key)
-                order_results = await self._place_binary_orders(
-                    private_key=private_key,
-                    condition_id=opportunity.condition_id,
-                    prices=prices,
-                    shares=shares,
-                )
                 for side, price in prices.items():
-                    order_result = order_results.get(side, {})
+                    res = await client.place_order(
+                        private_key=private_key, token_id=token_ids[side],
+                        side="buy", price=price, size=shares, tif="GTC",
+                    )
+                    if not res.success:
+                        # A leg failed to place: cancel every leg already placed
+                        # so we never hold an unhedged single side.
+                        for oid in placed:
+                            await client.cancel_order(private_key, oid)
+                        await queries.update_opportunity_status(db, opportunity_id, "failed")
+                        return ExecutionResult(
+                            success=False, trades=[], partial_fill=True,
+                            error=f"Leg {side} failed to place: {res.error}",
+                        )
+                    if res.order_id:
+                        placed.append(res.order_id)
                     trade = await queries.create_trade(
                         db,
                         user_id=user_id,
                         opportunity_id=opportunity_id,
                         market_id=opportunity.market_id,
                         condition_id=opportunity.condition_id,
+                        token_id=token_ids[side],
                         strategy_type="binary",
                         side=side,
                         size_usdc=Decimal(str(per_leg_cost[side])),
                         fill_price=Decimal(str(price)),
+                        filled_size=Decimal(str(res.filled_size)),
                         fees_paid=Decimal(str(fee_per_leg)),
-                        status="submitted",
+                        status=res.status,
                         is_paper=False,
-                        order_id=order_result.get("order_id"),
-                        tx_hash=order_result.get("tx_hash"),
-                        price_snapshot={
-                            "yes_ask": opportunity.yes_price,
-                            "no_ask": opportunity.no_price,
-                            "shares": shares,
-                        },
+                        order_id=res.order_id,
+                        tx_hash=res.tx_hash,
+                        price_snapshot={"yes_ask": opportunity.yes_price, "no_ask": opportunity.no_price, "shares": shares},
                     )
                     trades.append(trade)
 
                 await queries.update_opportunity_status(db, opportunity_id, "executed", executed_at=now)
             except Exception as e:
                 logger.error(f"Failed to execute binary arb: {e}")
-                await self._cancel_orders(trades)
+                for oid in placed:
+                    await client.cancel_order(private_key, oid)
                 await queries.update_opportunity_status(db, opportunity_id, "failed")
                 return ExecutionResult(success=False, trades=[], error=str(e))
 
@@ -266,27 +289,34 @@ class ExecutionEngine:
         )
 
     async def _reverify_binary(
-        self, db: AsyncSession, settings: dict, opportunity: BinaryArbitrageResult, opportunity_id: UUID
+        self, db: AsyncSession, settings: dict, opportunity: BinaryArbitrageResult,
+        opportunity_id: UUID, probe_notional: float,
     ) -> Optional[str]:
-        """Re-fetch order books and confirm the opportunity still clears. Returns error string or None."""
-        yes_book = await self.polymarket.get_order_book(opportunity.condition_id + "_yes")
-        no_book = await self.polymarket.get_order_book(opportunity.condition_id + "_no")
+        """
+        Re-fetch order books using REAL token IDs and confirm the opportunity still
+        clears — pricing at VWAP for the size we intend to fill (not top-of-book),
+        because the scan-time book may have moved by the time this later beat runs.
+        Returns an error string (and marks the opportunity) or None if still good.
+        """
+        yes_book = await self.polymarket.get_order_book(opportunity.yes_token_id)
+        no_book = await self.polymarket.get_order_book(opportunity.no_token_id)
 
         if not yes_book or not no_book:
             await queries.update_opportunity_status(db, opportunity_id, "failed")
             return "Failed to re-fetch order books"
 
-        new_yes_ask = PolymarketService.get_best_ask_price(yes_book)
-        new_no_ask = PolymarketService.get_best_ask_price(no_book)
+        # VWAP-at-size re-probe: the price we can actually fill our size at NOW
+        new_yes_ask = PolymarketService.get_fillable_price(yes_book, "buy", probe_notional)
+        new_no_ask = PolymarketService.get_fillable_price(no_book, "buy", probe_notional)
 
         if new_yes_ask is None or new_no_ask is None:
-            await queries.update_opportunity_status(db, opportunity_id, "failed")
-            return "Price no longer available"
+            await queries.update_opportunity_status(db, opportunity_id, "expired")
+            return "Insufficient depth to fill intended size at re-verify"
 
         new_sum = new_yes_ask + new_no_ask
         if new_sum >= 1.0:
             await queries.update_opportunity_status(db, opportunity_id, "expired")
-            return f"Price moved: new sum {new_sum:.4f} >= 1.0"
+            return f"Price moved: new VWAP sum {new_sum:.4f} >= 1.0"
 
         from app.bot.strategies.binary import calculate_binary_arbitrage
         new_result = calculate_binary_arbitrage(
@@ -376,48 +406,58 @@ class ExecutionEngine:
                 f"outcomes={num_legs} shares={shares:.2f} cost=${total_cost:.2f} net=${total_net_profit:.4f}"
             )
         else:
+            private_key = decrypt_private_key(config.encrypted_private_key)
+            token_ids = opportunity.outcome_token_ids or {}
+            if not all(token_ids.get(o) for o in prices):
+                await queries.update_opportunity_status(db, opportunity_id, "failed")
+                return ExecutionResult(success=False, trades=[], error="Missing token IDs for live order")
+
+            client = self.order_client()
+            placed = []
             try:
-                private_key = decrypt_private_key(config.encrypted_private_key)
-                placed = []
                 for outcome, price in prices.items():
-                    try:
-                        order_result = await self._place_outcome_order(
-                            private_key=private_key,
-                            condition_id=opportunity.condition_id,
-                            outcome=outcome,
-                            price=price,
-                            shares=shares,
-                        )
-                        trade = await queries.create_trade(
-                            db,
-                            user_id=user_id,
-                            opportunity_id=opportunity_id,
-                            market_id=opportunity.market_id,
-                            condition_id=opportunity.condition_id,
-                            strategy_type="multi_outcome",
-                            side=outcome,
-                            size_usdc=Decimal(str(per_leg_cost[outcome])),
-                            fill_price=Decimal(str(price)),
-                            fees_paid=Decimal(str(fee_per_leg)),
-                            status="submitted",
-                            is_paper=False,
-                            order_id=order_result.get("order_id"),
-                            tx_hash=order_result.get("tx_hash"),
-                            price_snapshot={"outcome_prices": prices, "shares": shares},
-                        )
-                        trades.append(trade)
-                        placed.append(order_result)
-                    except Exception as e:
-                        logger.error(f"Failed to place order for outcome {outcome}: {e}")
-                        await self._cancel_orders(trades)
+                    res = await client.place_order(
+                        private_key=private_key, token_id=token_ids[outcome],
+                        side="buy", price=price, size=shares, tif="GTC",
+                    )
+                    if not res.success:
+                        # Any leg failing to place -> cancel all placed legs so we
+                        # never hold an incomplete (unhedged) multi-outcome basket.
+                        for oid in placed:
+                            await client.cancel_order(private_key, oid)
                         await queries.update_opportunity_status(db, opportunity_id, "failed")
                         return ExecutionResult(
                             success=False, trades=[], partial_fill=True,
-                            error=f"Failed on outcome {outcome}: {e}",
+                            error=f"Outcome {outcome} failed to place: {res.error}",
                         )
+                    if res.order_id:
+                        placed.append(res.order_id)
+                    trade = await queries.create_trade(
+                        db,
+                        user_id=user_id,
+                        opportunity_id=opportunity_id,
+                        market_id=opportunity.market_id,
+                        condition_id=opportunity.condition_id,
+                        token_id=token_ids[outcome],
+                        strategy_type="multi_outcome",
+                        side=outcome,
+                        size_usdc=Decimal(str(per_leg_cost[outcome])),
+                        fill_price=Decimal(str(price)),
+                        filled_size=Decimal(str(res.filled_size)),
+                        fees_paid=Decimal(str(fee_per_leg)),
+                        status=res.status,
+                        is_paper=False,
+                        order_id=res.order_id,
+                        tx_hash=res.tx_hash,
+                        price_snapshot={"outcome_prices": prices, "shares": shares},
+                    )
+                    trades.append(trade)
 
                 await queries.update_opportunity_status(db, opportunity_id, "executed", executed_at=now)
             except Exception as e:
+                logger.error(f"Failed to execute multi-outcome arb: {e}")
+                for oid in placed:
+                    await client.cancel_order(private_key, oid)
                 await queries.update_opportunity_status(db, opportunity_id, "failed")
                 return ExecutionResult(success=False, trades=[], error=str(e))
 
@@ -470,8 +510,8 @@ class ExecutionEngine:
         # CLAMP: you can only sell tokens you actually hold — Polymarket has no
         # shorting. An unclamped sell would place a naked/failed order live, or
         # book a phantom negative position (corrupting average-cost) in paper.
-        profit_loss = 0.0
         exec_qty = intent.target_qty
+        avg_entry = 0.0
         if not is_buy:
             positions = await queries.get_open_positions(db, user_id, strategy_id=strategy_uuid)
             pos = positions.get(intent.token_id)
@@ -480,13 +520,68 @@ class ExecutionEngine:
             if exec_qty <= 0:
                 await queries.update_opportunity_status(db, opportunity_id, "expired")
                 return ExecutionResult(success=False, trades=[], error="No position to close")
-            profit_loss = (intent.limit_price - pos["avg_entry_price"]) * exec_qty
+            avg_entry = pos["avg_entry_price"]
 
-        signed_qty = exec_qty if is_buy else -exec_qty
-        notional = exec_qty * intent.limit_price
         now = datetime.now(timezone.utc)
 
         if is_paper:
+            # Paper-fill realism: a limit that doesn't cross the book rests unfilled
+            # (no position change, no P&L). A crossing limit fills at VWAP, not at the
+            # optimistic limit price. Intents built without book context default to
+            # crosses=True / est_fill_price=limit_price (back-compat).
+            crosses = getattr(intent, "crosses", True)
+            fill_price = getattr(intent, "est_fill_price", None) or intent.limit_price
+
+            if not crosses:
+                trade = await queries.create_trade(
+                    db, user_id=user_id, opportunity_id=opportunity_id,
+                    market_id=intent.market_id, condition_id=intent.condition_id,
+                    token_id=intent.token_id, strategy_id=strategy_uuid,
+                    strategy_type="strategy", side=f"{intent.side}:{intent.outcome}",
+                    size_usdc=Decimal(str(exec_qty * intent.limit_price)),
+                    fill_price=Decimal(str(intent.limit_price)),
+                    filled_size=Decimal("0"), fees_paid=Decimal("0"),
+                    profit_loss=Decimal("0"), status="open", is_paper=True,
+                    price_snapshot={"reason": intent.reason, "side": intent.side,
+                                    "token_id": intent.token_id, "resting": True},
+                )
+                await queries.update_opportunity_status(db, opportunity_id, "executed", executed_at=now)
+                logger.info(f"[PAPER] Strategy {intent.reason}: resting {intent.side} (limit did not cross)")
+            else:
+                notional = exec_qty * fill_price
+                # Realize P&L against the actual (VWAP) fill price on closes
+                pnl = (fill_price - avg_entry) * exec_qty if not is_buy else 0.0
+                signed_qty = exec_qty if is_buy else -exec_qty
+                trade = await queries.create_trade(
+                    db, user_id=user_id, opportunity_id=opportunity_id,
+                    market_id=intent.market_id, condition_id=intent.condition_id,
+                    token_id=intent.token_id, strategy_id=strategy_uuid,
+                    strategy_type="strategy", side=f"{intent.side}:{intent.outcome}",
+                    size_usdc=Decimal(str(notional)), fill_price=Decimal(str(fill_price)),
+                    filled_size=Decimal(str(signed_qty)), fees_paid=Decimal("0"),
+                    profit_loss=Decimal(str(pnl)), status="filled", is_paper=True,
+                    price_snapshot={"reason": intent.reason, "side": intent.side, "token_id": intent.token_id},
+                )
+                await queries.update_opportunity_status(db, opportunity_id, "executed", executed_at=now)
+                logger.info(
+                    f"[PAPER] Strategy {intent.reason}: {intent.side} {exec_qty:.2f} "
+                    f"{intent.outcome}@{fill_price:.4f} (${notional:.2f})"
+                )
+        else:
+            private_key = decrypt_private_key(config.encrypted_private_key)
+            if not intent.token_id:
+                await queries.update_opportunity_status(db, opportunity_id, "failed")
+                return ExecutionResult(success=False, trades=[], error="Missing token ID for live order")
+            client = self.order_client()
+            notional = exec_qty * intent.limit_price
+            res = await client.place_order(
+                private_key=private_key, token_id=intent.token_id,
+                side=intent.side, price=intent.limit_price, size=exec_qty,
+                tif=str((config.settings or {}).get("strategy_tif", "GTC")),
+            )
+            if not res.success:
+                await queries.update_opportunity_status(db, opportunity_id, "failed")
+                return ExecutionResult(success=False, trades=[], error=f"Order failed to place: {res.error}")
             trade = await queries.create_trade(
                 db,
                 user_id=user_id,
@@ -499,77 +594,16 @@ class ExecutionEngine:
                 side=f"{intent.side}:{intent.outcome}",
                 size_usdc=Decimal(str(notional)),
                 fill_price=Decimal(str(intent.limit_price)),
-                filled_size=Decimal(str(signed_qty)),
-                fees_paid=Decimal("0"),
-                profit_loss=Decimal(str(profit_loss)),
-                status="filled",
-                is_paper=True,
+                filled_size=Decimal(str(res.filled_size if is_buy else -res.filled_size)),
+                status=res.status,
+                is_paper=False,
+                order_id=res.order_id,
+                tx_hash=res.tx_hash,
                 price_snapshot={"reason": intent.reason, "side": intent.side, "token_id": intent.token_id},
             )
             await queries.update_opportunity_status(db, opportunity_id, "executed", executed_at=now)
-            logger.info(
-                f"[PAPER] Strategy {intent.reason}: {intent.side} {exec_qty:.2f} "
-                f"{intent.outcome}@{intent.limit_price:.4f} (${notional:.2f})"
-            )
-        else:
-            try:
-                private_key = decrypt_private_key(config.encrypted_private_key)
-                order_result = await self._place_outcome_order(
-                    private_key=private_key,
-                    condition_id=intent.condition_id,
-                    outcome=intent.outcome,
-                    price=intent.limit_price,
-                    shares=exec_qty,
-                )
-                trade = await queries.create_trade(
-                    db,
-                    user_id=user_id,
-                    opportunity_id=opportunity_id,
-                    market_id=intent.market_id,
-                    condition_id=intent.condition_id,
-                    token_id=intent.token_id,
-                    strategy_id=strategy_uuid,
-                    strategy_type="strategy",
-                    side=f"{intent.side}:{intent.outcome}",
-                    size_usdc=Decimal(str(notional)),
-                    fill_price=Decimal(str(intent.limit_price)),
-                    status="submitted",
-                    is_paper=False,
-                    order_id=order_result.get("order_id"),
-                    tx_hash=order_result.get("tx_hash"),
-                    price_snapshot={"reason": intent.reason, "side": intent.side, "token_id": intent.token_id},
-                )
-                await queries.update_opportunity_status(db, opportunity_id, "executed", executed_at=now)
-            except Exception as e:
-                logger.error(f"Failed to execute strategy intent: {e}")
-                await queries.update_opportunity_status(db, opportunity_id, "failed")
-                return ExecutionResult(success=False, trades=[], error=str(e))
 
         return ExecutionResult(
             success=True,
             trades=[{"id": str(trade.id), "side": trade.side, "status": trade.status}],
         )
-
-    async def _place_binary_orders(
-        self, private_key: str, condition_id: str, prices: dict[str, float], shares: float,
-    ) -> dict[str, dict]:
-        """
-        Place equal-share YES and NO limit orders via py-clob-client.
-        In production this is replaced by the real CLOB client (Phase 3).
-        """
-        logger.info(f"Placing binary orders: {prices} shares={shares}")
-        return {side: {"order_id": f"mock_{side}_order", "tx_hash": None} for side in prices}
-
-    async def _place_outcome_order(
-        self, private_key: str, condition_id: str, outcome: str, price: float, shares: float,
-    ) -> dict:
-        """Place a single outcome limit order for `shares` shares at `price`."""
-        logger.info(f"Placing order: {outcome}@{price} shares={shares}")
-        return {"order_id": f"mock_{outcome}_order", "tx_hash": None}
-
-    async def _cancel_orders(self, trades: list) -> None:
-        """Attempt to cancel all orders from a failed trade set."""
-        for trade in trades:
-            if hasattr(trade, "order_id") and trade.order_id:
-                logger.warning(f"Attempting to cancel order: {trade.order_id}")
-                # In production (Phase 3): client.cancel_order(trade.order_id)

@@ -35,6 +35,7 @@ class MultiOutcomeArbitrageResult:
     min_liquidity: float
     num_outcomes: int
     is_profitable: bool
+    outcome_token_ids: dict = None
 
 
 def calculate_multi_outcome_arbitrage(
@@ -45,6 +46,7 @@ def calculate_multi_outcome_arbitrage(
     outcome_prices: dict[str, float],
     outcome_liquidities: dict[str, float] = None,
     gas_cost_per_tx: float = DEFAULT_GAS_COST_PER_TX,
+    outcome_token_ids: dict = None,
 ) -> MultiOutcomeArbitrageResult:
     """
     Calculate multi-outcome arbitrage.
@@ -83,6 +85,7 @@ def calculate_multi_outcome_arbitrage(
         min_liquidity=min_liquidity,
         num_outcomes=num_outcomes,
         is_profitable=net_profit > 0,
+        outcome_token_ids=outcome_token_ids or {},
     )
 
 
@@ -101,6 +104,7 @@ def scan_multi_outcome_markets(
 
         outcome_prices = {}
         outcome_liquidities = {}
+        outcome_token_ids = {}
         all_valid = True
 
         for token in tokens:
@@ -123,6 +127,7 @@ def scan_multi_outcome_markets(
 
             outcome_prices[outcome] = ask
             outcome_liquidities[outcome] = min_liquidity
+            outcome_token_ids[outcome] = token_id
 
         if not all_valid:
             continue
@@ -132,6 +137,7 @@ def scan_multi_outcome_markets(
             condition_id=market.get("condition_id", ""),
             market_question=market.get("question", ""),
             market_slug=market.get("slug", ""),
+            outcome_token_ids=outcome_token_ids,
             outcome_prices=outcome_prices,
             outcome_liquidities=outcome_liquidities,
         )

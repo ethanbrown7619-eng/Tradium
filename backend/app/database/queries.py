@@ -190,6 +190,46 @@ async def get_trades(
     return list(result.scalars().all())
 
 
+async def get_open_order_trades(session: AsyncSession, limit: int = 500) -> list[Trade]:
+    """Live trades whose orders are still working (submitted/partial) — for fill polling."""
+    result = await session.execute(
+        select(Trade)
+        .where(and_(Trade.is_paper == False, Trade.status.in_(["submitted", "partial"])))  # noqa: E712
+        .order_by(Trade.executed_at)
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def update_trade_fill(
+    session: AsyncSession, trade_id: UUID, status: str,
+    filled_size: Optional[float] = None, fill_price: Optional[float] = None,
+    settled: bool = False,
+) -> Optional[Trade]:
+    """Update a trade with the latest fill state from the CLOB."""
+    result = await session.execute(select(Trade).where(Trade.id == trade_id))
+    trade = result.scalar_one_or_none()
+    if not trade:
+        return None
+    trade.status = status
+    if filled_size is not None:
+        trade.filled_size = filled_size
+    if fill_price is not None:
+        trade.fill_price = fill_price
+    if settled:
+        trade.settled_at = func.now()
+    await session.commit()
+    await session.refresh(trade)
+    return trade
+
+
+async def get_trades_for_opportunity(session: AsyncSession, opportunity_id: UUID) -> list[Trade]:
+    result = await session.execute(
+        select(Trade).where(Trade.opportunity_id == opportunity_id)
+    )
+    return list(result.scalars().all())
+
+
 async def get_trade_summary(session: AsyncSession, user_id: UUID, since: Optional[datetime] = None) -> dict:
     q = select(
         func.count(Trade.id).label("total_trades"),

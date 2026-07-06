@@ -80,6 +80,7 @@ class Opportunity(Base):
 
     strategy_type = Column(String(50), nullable=False)  # binary, multi_outcome, correlated
     outcome_prices = Column(JSONB, nullable=False)  # {"YES": 0.45, "NO": 0.52} or {"A": 0.40, ...}
+    token_ids = Column(JSONB, nullable=True)  # {"YES": "0x..", "NO": "0x.."} real CLOB token IDs
     price_sum = Column(Numeric(10, 6), nullable=False)
     estimated_profit_pct = Column(Numeric(10, 6), nullable=False)
     estimated_profit_usdc = Column(Numeric(10, 4), nullable=True)

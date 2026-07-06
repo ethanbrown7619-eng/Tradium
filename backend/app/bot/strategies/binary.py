@@ -45,6 +45,8 @@ class BinaryArbitrageResult:
     no_liquidity: float
     min_liquidity: float
     is_profitable: bool
+    yes_token_id: str = ""
+    no_token_id: str = ""
 
 
 def calculate_binary_arbitrage(
@@ -57,6 +59,8 @@ def calculate_binary_arbitrage(
     yes_liquidity: float = 0.0,
     no_liquidity: float = 0.0,
     gas_cost: float = DEFAULT_GAS_COST * 2,
+    yes_token_id: str = "",
+    no_token_id: str = "",
 ) -> BinaryArbitrageResult:
     """
     Calculate whether a binary arbitrage opportunity exists.
@@ -99,6 +103,8 @@ def calculate_binary_arbitrage(
         no_liquidity=no_liquidity,
         min_liquidity=min_liquidity,
         is_profitable=net_profit > 0,
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
     )
 
 
@@ -163,6 +169,8 @@ def scan_binary_markets(markets: list[dict], order_books: dict, min_liquidity: f
             # Liquidity is the size we verified is fillable at the VWAP above
             yes_liquidity=min_liquidity,
             no_liquidity=min_liquidity,
+            yes_token_id=yes_token_id,
+            no_token_id=no_token_id,
         )
 
         if result.is_profitable:

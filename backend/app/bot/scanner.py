@@ -229,6 +229,7 @@ def _opp_to_binary_result(opp: Opportunity):
     gas = 0.01
     net = gross - fee - gas
 
+    token_ids = opp.token_ids or {}
     return BinaryArbitrageResult(
         market_id=opp.market_id,
         condition_id=opp.condition_id or "",
@@ -246,6 +247,8 @@ def _opp_to_binary_result(opp: Opportunity):
         no_liquidity=float(opp.liquidity_depth or 0),
         min_liquidity=float(opp.liquidity_depth or 0),
         is_profitable=net > 0,
+        yes_token_id=token_ids.get("YES", ""),
+        no_token_id=token_ids.get("NO", ""),
     )
 
 
@@ -276,6 +279,7 @@ def _opp_to_multi_result(opp: Opportunity):
         min_liquidity=float(opp.liquidity_depth or 0),
         num_outcomes=len(prices),
         is_profitable=net > 0,
+        outcome_token_ids=opp.token_ids or {},
     )
 
 

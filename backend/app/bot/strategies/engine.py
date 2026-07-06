@@ -226,6 +226,8 @@ class StrategyIntent:
     target_qty: float
     limit_price: float
     reason: str        # "entry" | "exit" | "stop"
+    est_fill_price: Optional[float] = None  # VWAP fill estimate (paper realism)
+    crosses: bool = True                    # does the limit cross the book right now?
 
 
 def _limit_price(book: dict, side: str, order_spec: dict) -> Optional[float]:
@@ -275,18 +277,35 @@ def evaluate_strategy_for_market(
     pos = ctx.positions.get(token_id)
     order_spec = strategy.get("order", {})
 
+    def _make(side, qty, price, reason):
+        # Compute whether the limit crosses the book NOW and the VWAP fill estimate,
+        # so paper execution can model fills realistically (a non-crossing limit rests
+        # unfilled; a crossing one fills at VWAP, not at the optimistic limit price).
+        notional = qty * price
+        if side == "buy":
+            best = PolymarketService.get_best_ask_price(book)
+            crosses = best is not None and price >= best
+            vwap = PolymarketService.get_fillable_price(book, "buy", notional)
+        else:
+            best = PolymarketService.get_best_bid_price(book)
+            crosses = best is not None and price <= best
+            vwap = PolymarketService.get_fillable_price(book, "sell", notional)
+        return StrategyIntent(
+            strategy["id"], market["market_id"], market.get("condition_id", ""),
+            token_id, outcome, side, qty, price, reason,
+            est_fill_price=vwap if vwap is not None else price, crosses=crosses,
+        )
+
     # ── Closing side first: stop takes precedence over exit ──
     if pos and pos.qty > 0:
         if strategy.get("stop") and evaluate(strategy["stop"], ctx):
             price = _limit_price(book, "sell", order_spec)
             if price:
-                return StrategyIntent(strategy["id"], market["market_id"], market.get("condition_id", ""),
-                                      token_id, outcome, "sell", pos.qty, price, "stop")
+                return _make("sell", pos.qty, price, "stop")
         if strategy.get("exit") and evaluate(strategy["exit"], ctx):
             price = _limit_price(book, "sell", order_spec)
             if price:
-                return StrategyIntent(strategy["id"], market["market_id"], market.get("condition_id", ""),
-                                      token_id, outcome, "sell", pos.qty, price, "exit")
+                return _make("sell", pos.qty, price, "exit")
         return None  # holding; no entry while in a position
 
     # ── Opening side: respect max_open_positions ──
@@ -300,8 +319,7 @@ def evaluate_strategy_for_market(
         qty = _target_qty(strategy, price, budget)
         if qty <= 0:
             return None
-        return StrategyIntent(strategy["id"], market["market_id"], market.get("condition_id", ""),
-                              token_id, outcome, "buy", qty, price, "entry")
+        return _make("buy", qty, price, "entry")
     return None
 
 

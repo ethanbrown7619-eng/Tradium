@@ -291,6 +291,31 @@ class TestExecuteStrategyIntent:
         assert len(store["trades"]) == 0
         assert "No position" in res.error
 
+    def test_non_crossing_limit_rests_unfilled(self, monkeypatch):
+        # A buy limit that does not cross the book must NOT book a fill in paper
+        store = {"claimed": set(), "trades": [], "opp_status": {}, "positions": {}}
+        _install_exec_fakes(monkeypatch, store)
+        eng = ExecutionEngine(polymarket=SimpleNamespace())
+        intent = StrategyIntent(str(uuid4()), "m", "c", "tok", "YES", "buy", 200.0, 0.25,
+                                "entry", est_fill_price=0.25, crosses=False)
+        res = asyncio.run(eng.execute_strategy_intent(SimpleNamespace(), uuid4(), _paper_cfg(), intent, uuid4()))
+        assert res.success is True
+        t = store["trades"][0]
+        assert float(t["filled_size"]) == 0.0
+        assert t["status"] == "open"
+
+    def test_crossing_limit_fills_at_vwap_not_limit(self, monkeypatch):
+        # Crossing buy fills at the VWAP estimate, which is better than the limit
+        store = {"claimed": set(), "trades": [], "opp_status": {}, "positions": {}}
+        _install_exec_fakes(monkeypatch, store)
+        eng = ExecutionEngine(polymarket=SimpleNamespace())
+        intent = StrategyIntent(str(uuid4()), "m", "c", "tok", "YES", "buy", 200.0, 0.40,
+                                "entry", est_fill_price=0.30, crosses=True)
+        res = asyncio.run(eng.execute_strategy_intent(SimpleNamespace(), uuid4(), _paper_cfg(), intent, uuid4()))
+        assert res.success is True
+        t = store["trades"][0]
+        assert float(t["fill_price"]) == pytest.approx(0.30)  # VWAP, not the 0.40 limit
+
     def test_claim_prevents_double_execution(self, monkeypatch):
         store = {"claimed": set(), "trades": [], "opp_status": {}, "positions": {}}
         _install_exec_fakes(monkeypatch, store)

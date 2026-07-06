@@ -41,6 +41,10 @@ celery_app.conf.beat_schedule = {
         "task": "app.worker.cleanup_expired_opportunities",
         "schedule": 300.0,  # Every 5 minutes
     },
+    "poll-open-orders": {
+        "task": "app.worker.poll_open_orders_task",
+        "schedule": 5.0,  # Every 5 seconds — fills must be reconciled quickly
+    },
 }
 
 
@@ -61,6 +65,38 @@ def scan_markets_task(self):
         _run_async(run_scan_cycle())
     except Exception as e:
         self.retry(exc=e, countdown=5)
+
+
+@celery_app.task(name="app.worker.poll_open_orders_task")
+def poll_open_orders_task():
+    """Poll working live orders, reconcile fills, and enforce the arb hedge guard."""
+    async def _poll():
+        from app.database.session import async_session
+        from app.database import queries
+        from app.services.clob import ClobOrderClient
+        from app.services.encryption import decrypt_private_key
+        from app.bot.fill_monitor import monitor_open_orders
+
+        order_client = ClobOrderClient()
+        async with async_session() as db:
+            _key_cache: dict = {}
+
+            async def resolve_key(user_id):
+                if user_id in _key_cache:
+                    return _key_cache[user_id]
+                cfg = await queries.get_user_config(db, user_id)
+                key = None
+                if cfg and cfg.encrypted_private_key:
+                    try:
+                        key = decrypt_private_key(cfg.encrypted_private_key)
+                    except ValueError:
+                        key = None
+                _key_cache[user_id] = key
+                return key
+
+            return await monitor_open_orders(db, order_client, resolve_key)
+
+    _run_async(_poll())
 
 
 @celery_app.task(name="app.worker.daily_summary_task")
