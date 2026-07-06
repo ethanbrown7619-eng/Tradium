@@ -64,6 +64,34 @@ class TestStrategyValidation:
     def test_indicator_whitelist_has_no_dunder(self):
         assert all(not n.startswith("__") for n in INDICATOR_NAMES)
 
+    def test_oversized_window_rejected(self):
+        with pytest.raises(ValidationError):
+            StrategyDefinition(
+                name="cpu-bomb",
+                entry={"cmp": {"lhs": {"name": "sma", "token": "YES", "window": 10_000_000}, "op": ">", "rhs": 0.1}},
+            )
+
+    def test_oversized_vwap_size_rejected(self):
+        with pytest.raises(ValidationError):
+            StrategyDefinition(
+                name="big-probe",
+                entry={"cmp": {"lhs": {"name": "vwap_at", "token": "YES", "size": 1e12}, "op": "<", "rhs": 0.5}},
+            )
+
+    def test_nan_literal_rejected(self):
+        with pytest.raises(ValidationError):
+            StrategyDefinition(
+                name="nan",
+                entry={"cmp": {"lhs": {"name": "best_ask"}, "op": "<", "rhs": float("inf")}},
+            )
+
+    def test_deeply_nested_tree_rejected(self):
+        node = {"cmp": {"lhs": {"name": "best_ask"}, "op": "<", "rhs": 0.5}}
+        for _ in range(30):  # exceed MAX_CONDITION_DEPTH
+            node = {"all": [node]}
+        with pytest.raises(ValidationError):
+            StrategyDefinition(name="deep", entry=node)
+
 
 # ── Engine helpers ──
 
@@ -237,6 +265,31 @@ class TestExecuteStrategyIntent:
         assert float(t["filled_size"]) == pytest.approx(-200.0)   # negative = closing
         # realized = (0.25 - 0.20) * 200 = 10.0
         assert float(t["profit_loss"]) == pytest.approx(10.0)
+
+    def test_sell_clamps_to_held_position(self, monkeypatch):
+        # Strategy asks to sell 500 but only 200 held -> clamp to 200
+        store = {"claimed": set(), "trades": [], "opp_status": {},
+                 "positions": {"tok": {"qty": 200.0, "avg_entry_price": 0.20}}}
+        _install_exec_fakes(monkeypatch, store)
+        eng = ExecutionEngine(polymarket=SimpleNamespace())
+        intent = StrategyIntent(str(uuid4()), "m", "c", "tok", "YES", "sell", 500.0, 0.25, "exit")
+        res = asyncio.run(eng.execute_strategy_intent(SimpleNamespace(), uuid4(), _paper_cfg(), intent, uuid4()))
+        assert res.success is True
+        t = store["trades"][0]
+        assert float(t["filled_size"]) == pytest.approx(-200.0)   # clamped, not -500
+        # realized only on the 200 actually held
+        assert float(t["profit_loss"]) == pytest.approx((0.25 - 0.20) * 200)
+
+    def test_sell_with_no_position_is_rejected(self, monkeypatch):
+        store = {"claimed": set(), "trades": [], "opp_status": {}, "positions": {}}
+        _install_exec_fakes(monkeypatch, store)
+        eng = ExecutionEngine(polymarket=SimpleNamespace())
+        intent = StrategyIntent(str(uuid4()), "m", "c", "tok", "YES", "sell", 200.0, 0.25, "exit")
+        opp_id = uuid4()
+        res = asyncio.run(eng.execute_strategy_intent(SimpleNamespace(), uuid4(), _paper_cfg(), intent, opp_id))
+        assert res.success is False
+        assert len(store["trades"]) == 0
+        assert "No position" in res.error
 
     def test_claim_prevents_double_execution(self, monkeypatch):
         store = {"claimed": set(), "trades": [], "opp_status": {}, "positions": {}}

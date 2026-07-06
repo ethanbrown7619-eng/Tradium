@@ -305,6 +305,28 @@ async def delete_strategy(session: AsyncSession, strategy_id: UUID) -> bool:
     return result.rowcount > 0
 
 
+async def get_inflight_strategy_tokens(session: AsyncSession, user_id: UUID) -> set:
+    """
+    Token IDs that already have a strategy opportunity in flight (queued/executing).
+
+    Used for anti-thrash idempotency: don't emit a second intent for a token whose
+    prior intent hasn't resolved yet — otherwise a flip-flopping strategy could
+    stack duplicate open/close orders on the same position across ticks.
+    """
+    result = await session.execute(
+        select(Opportunity.outcome_prices).where(and_(
+            Opportunity.user_id == user_id,
+            Opportunity.strategy_type == "strategy",
+            Opportunity.status.in_(["queued", "executing"]),
+        ))
+    )
+    tokens = set()
+    for (payload,) in result.all():
+        if isinstance(payload, dict) and payload.get("token_id"):
+            tokens.add(payload["token_id"])
+    return tokens
+
+
 async def get_open_positions(session: AsyncSession, user_id: UUID, strategy_id: Optional[UUID] = None) -> dict:
     """
     Aggregate strategy trades into net positions per token_id.

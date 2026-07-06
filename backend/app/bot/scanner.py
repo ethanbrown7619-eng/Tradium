@@ -148,10 +148,20 @@ async def run_strategies_for_user(db: AsyncSession, config: UserConfig) -> dict:
 
     order_books = await polymarket.get_order_books_batch(list(all_token_ids))
     budget = settings.get("usdc_budget", 1000.0)
+    now = datetime.now(timezone.utc)
+
+    # Anti-thrash idempotency: skip tokens with an intent already in flight
+    inflight_tokens = await queries.get_inflight_strategy_tokens(db, user_id)
 
     intents_created = 0
     executed = 0
     for strat in strategies:
+        # Cooldown: don't let a strategy fire more often than cooldown_seconds
+        cooldown = int((strat.definition or {}).get("cooldown_seconds", 0) or 0)
+        if cooldown and strat.last_triggered_at:
+            if (now - strat.last_triggered_at).total_seconds() < cooldown:
+                continue
+
         strat_dict = dict(strat.definition or {})
         strat_dict["id"] = str(strat.id)
 
@@ -172,6 +182,10 @@ async def run_strategies_for_user(db: AsyncSession, config: UserConfig) -> dict:
             )
             if not intent:
                 continue
+            # Skip if this token already has an unresolved intent in flight
+            if intent.token_id in inflight_tokens:
+                continue
+            inflight_tokens.add(intent.token_id)
 
             opp = await queries.create_opportunity(
                 db,
@@ -196,6 +210,7 @@ async def run_strategies_for_user(db: AsyncSession, config: UserConfig) -> dict:
             result = await executor.execute_strategy_intent(db, user_id, config, intent, opp.id)
             if result.success:
                 executed += 1
+                await queries.update_strategy(db, strat.id, last_triggered_at=now)
                 if intent.reason == "entry":
                     open_count += 1
 

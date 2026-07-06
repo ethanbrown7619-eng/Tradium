@@ -467,15 +467,23 @@ class ExecutionEngine:
                 strategy_uuid = None
 
         # Realized P&L only exists when closing against a known average entry.
+        # CLAMP: you can only sell tokens you actually hold — Polymarket has no
+        # shorting. An unclamped sell would place a naked/failed order live, or
+        # book a phantom negative position (corrupting average-cost) in paper.
         profit_loss = 0.0
+        exec_qty = intent.target_qty
         if not is_buy:
             positions = await queries.get_open_positions(db, user_id, strategy_id=strategy_uuid)
             pos = positions.get(intent.token_id)
-            if pos:
-                close_qty = min(intent.target_qty, pos["qty"])
-                profit_loss = (intent.limit_price - pos["avg_entry_price"]) * close_qty
+            held = pos["qty"] if pos else 0.0
+            exec_qty = min(intent.target_qty, held)
+            if exec_qty <= 0:
+                await queries.update_opportunity_status(db, opportunity_id, "expired")
+                return ExecutionResult(success=False, trades=[], error="No position to close")
+            profit_loss = (intent.limit_price - pos["avg_entry_price"]) * exec_qty
 
-        signed_qty = intent.target_qty if is_buy else -intent.target_qty
+        signed_qty = exec_qty if is_buy else -exec_qty
+        notional = exec_qty * intent.limit_price
         now = datetime.now(timezone.utc)
 
         if is_paper:
@@ -500,7 +508,7 @@ class ExecutionEngine:
             )
             await queries.update_opportunity_status(db, opportunity_id, "executed", executed_at=now)
             logger.info(
-                f"[PAPER] Strategy {intent.reason}: {intent.side} {intent.target_qty:.2f} "
+                f"[PAPER] Strategy {intent.reason}: {intent.side} {exec_qty:.2f} "
                 f"{intent.outcome}@{intent.limit_price:.4f} (${notional:.2f})"
             )
         else:
@@ -511,7 +519,7 @@ class ExecutionEngine:
                     condition_id=intent.condition_id,
                     outcome=intent.outcome,
                     price=intent.limit_price,
-                    shares=intent.target_qty,
+                    shares=exec_qty,
                 )
                 trade = await queries.create_trade(
                     db,
