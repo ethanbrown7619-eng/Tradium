@@ -114,6 +114,48 @@ async def claim_opportunity(
     return result.rowcount == 1
 
 
+def _orphaned_executing_stmt(cutoff: datetime):
+    """UPDATE stmt: reap opportunities stuck in 'executing' since before `cutoff` -> 'failed'."""
+    return (
+        update(Opportunity)
+        .where(and_(Opportunity.status == "executing", Opportunity.found_at < cutoff))
+        .values(status="failed")
+    )
+
+
+def _stale_open_stmt(cutoff: datetime):
+    """UPDATE stmt: expire still-open (pending/queued) opportunities older than `cutoff`."""
+    return (
+        update(Opportunity)
+        .where(and_(Opportunity.status.in_(["pending", "queued"]), Opportunity.found_at < cutoff))
+        .values(status="expired")
+    )
+
+
+async def reap_orphaned_executing(session: AsyncSession, older_than_seconds: int = 120) -> int:
+    """
+    Reset opportunities stranded in 'executing' (executor crashed mid-flight) to 'failed'.
+
+    The atomic claim commits queued->executing before execution work runs, so a crash
+    would otherwise leave the row 'executing' forever — and the claim guard guarantees
+    it is never retried. We reset to 'failed' (not 'queued') so a possibly half-placed
+    live order is never silently auto-retried; it surfaces for inspection instead.
+    Execution takes seconds, so anything 'executing' for >2 min is orphaned.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)
+    result = await session.execute(_orphaned_executing_stmt(cutoff))
+    await session.commit()
+    return result.rowcount
+
+
+async def expire_stale_opportunities(session: AsyncSession, older_than_seconds: int = 300) -> int:
+    """Expire pending/queued opportunities older than `older_than_seconds`."""
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)
+    result = await session.execute(_stale_open_stmt(cutoff))
+    await session.commit()
+    return result.rowcount
+
+
 # ── Trade queries ──
 
 async def create_trade(session: AsyncSession, **kwargs) -> Trade:

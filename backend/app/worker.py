@@ -3,6 +3,7 @@ Celery worker configuration.
 Handles background scanning tasks and scheduled jobs.
 """
 import asyncio
+import logging
 from celery import Celery
 from celery.schedules import crontab
 from app.config import get_settings
@@ -94,21 +95,22 @@ def daily_summary_task():
 
 @celery_app.task(name="app.worker.cleanup_expired_opportunities")
 def cleanup_expired_opportunities():
-    """Mark old pending opportunities as expired."""
+    """
+    Expire stale open opportunities and reap orphaned 'executing' claims.
+    The reaper is a liveness/stuck-capital safeguard: without it, an executor crash
+    after the atomic queued->executing claim would strand an opportunity forever.
+    """
     async def _cleanup():
         from app.database.session import async_session
-        from app.database.schema import Opportunity
-        from sqlalchemy import update
-        from datetime import datetime, timezone, timedelta
+        from app.database import queries
 
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
         async with async_session() as db:
-            await db.execute(
-                update(Opportunity)
-                .where(Opportunity.status.in_(["pending", "queued"]))
-                .where(Opportunity.found_at < cutoff)
-                .values(status="expired")
-            )
-            await db.commit()
+            expired = await queries.expire_stale_opportunities(db, older_than_seconds=300)
+            reaped = await queries.reap_orphaned_executing(db, older_than_seconds=120)
+            if reaped:
+                logging.getLogger(__name__).warning(
+                    f"Reaped {reaped} orphaned 'executing' opportunities -> failed"
+                )
+            return expired, reaped
 
     _run_async(_cleanup())
