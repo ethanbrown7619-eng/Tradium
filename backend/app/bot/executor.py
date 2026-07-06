@@ -234,26 +234,29 @@ class ExecutionEngine:
                 await queries.update_opportunity_status(db, opportunity_id, "failed")
                 return ExecutionResult(success=False, trades=[], error="Missing token IDs for live order")
 
+            # FOK sequencing: two-leg arb can't be atomic across two books, so we
+            # place each leg fill-or-kill IN ORDER and only fire the next leg once
+            # the prior fully fills. If a later leg kills, we AUTO-UNWIND the legs
+            # already filled — never leave a naked (unhedged, directional) leg.
             client = self.order_client()
-            placed = []  # (order_id) for cancellation on failure
+            filled_legs = []  # (side, token_id, shares, fill_price)
             try:
                 for side, price in prices.items():
                     res = await client.place_order(
                         private_key=private_key, token_id=token_ids[side],
-                        side="buy", price=price, size=shares, tif="GTC",
+                        side="buy", price=price, size=shares, tif="FOK",
                     )
-                    if not res.success:
-                        # A leg failed to place: cancel every leg already placed
-                        # so we never hold an unhedged single side.
-                        for oid in placed:
-                            await client.cancel_order(private_key, oid)
-                        await queries.update_opportunity_status(db, opportunity_id, "failed")
+                    if not (res.success and res.status == "filled"):
+                        # Leg killed -> flatten everything already filled, then bail
+                        await self._unwind_legs(db, user_id, config, opportunity_id, filled_legs, "binary")
+                        status = "partial" if filled_legs else "failed"
+                        await queries.update_opportunity_status(db, opportunity_id, status)
                         return ExecutionResult(
-                            success=False, trades=[], partial_fill=True,
-                            error=f"Leg {side} failed to place: {res.error}",
+                            success=False, trades=[], partial_fill=bool(filled_legs),
+                            error=f"Leg {side} FOK killed; unwound {len(filled_legs)} filled leg(s)",
                         )
-                    if res.order_id:
-                        placed.append(res.order_id)
+                    fill_price = res.fill_price if res.fill_price is not None else price
+                    filled_legs.append((side, token_ids[side], shares, fill_price))
                     trade = await queries.create_trade(
                         db,
                         user_id=user_id,
@@ -264,10 +267,10 @@ class ExecutionEngine:
                         strategy_type="binary",
                         side=side,
                         size_usdc=Decimal(str(per_leg_cost[side])),
-                        fill_price=Decimal(str(price)),
+                        fill_price=Decimal(str(fill_price)),
                         filled_size=Decimal(str(res.filled_size)),
                         fees_paid=Decimal(str(fee_per_leg)),
-                        status=res.status,
+                        status="filled",
                         is_paper=False,
                         order_id=res.order_id,
                         tx_hash=res.tx_hash,
@@ -278,8 +281,7 @@ class ExecutionEngine:
                 await queries.update_opportunity_status(db, opportunity_id, "executed", executed_at=now)
             except Exception as e:
                 logger.error(f"Failed to execute binary arb: {e}")
-                for oid in placed:
-                    await client.cancel_order(private_key, oid)
+                await self._unwind_legs(db, user_id, config, opportunity_id, filled_legs, "binary")
                 await queries.update_opportunity_status(db, opportunity_id, "failed")
                 return ExecutionResult(success=False, trades=[], error=str(e))
 
@@ -332,6 +334,49 @@ class ExecutionEngine:
             await queries.update_opportunity_status(db, opportunity_id, "expired")
             return f"Opportunity no longer profitable after re-check: {new_result.net_profit_pct:.2f}%"
         return None
+
+    async def _unwind_legs(self, db, user_id, config, opportunity_id, filled_legs, strategy_type):
+        """
+        Flatten already-filled legs of an arb whose remaining leg killed. Leaving a
+        naked (unhedged, directional) leg for a human is unacceptable for a neutral
+        bot on real money: bounded flatten cost now beats unbounded drift later.
+        Each filled leg is sold back marketably (FOK at the best bid). A leg that
+        cannot be flattened is logged CRITICAL as a residual naked position.
+        """
+        if not filled_legs:
+            return
+        private_key = decrypt_private_key(config.encrypted_private_key)
+        client = self.order_client()
+        for side, token_id, qty, entry_price in filled_legs:
+            try:
+                book = await self.polymarket.get_order_book(token_id)
+                bid = PolymarketService.get_best_bid_price(book)
+                sell_price = bid if bid is not None else 0.01
+                res = await client.place_order(
+                    private_key=private_key, token_id=token_id,
+                    side="sell", price=sell_price, size=qty, tif="FOK",
+                )
+                realized = (sell_price - entry_price) * qty  # typically a small loss
+                await queries.create_trade(
+                    db, user_id=user_id, opportunity_id=opportunity_id,
+                    market_id="", condition_id=None, token_id=token_id,
+                    strategy_type=strategy_type, side=f"unwind:{side}",
+                    size_usdc=Decimal(str(qty * sell_price)),
+                    fill_price=Decimal(str(sell_price)),
+                    filled_size=Decimal(str(-qty if (res.success and res.status == 'filled') else 0)),
+                    fees_paid=Decimal("0"),
+                    profit_loss=Decimal(str(realized if (res.success and res.status == 'filled') else 0)),
+                    status="filled" if (res.success and res.status == "filled") else "failed",
+                    is_paper=False, order_id=res.order_id,
+                    price_snapshot={"unwind": True, "entry_price": entry_price},
+                )
+                if not (res.success and res.status == "filled"):
+                    logger.critical(
+                        f"RESIDUAL NAKED LEG: could not flatten {qty} of {token_id} "
+                        f"(opp {opportunity_id}) — manual intervention required"
+                    )
+            except Exception as e:
+                logger.critical(f"Unwind failed for {token_id} (opp {opportunity_id}): {e}")
 
     async def execute_multi_outcome_arbitrage(
         self,
@@ -412,26 +457,26 @@ class ExecutionEngine:
                 await queries.update_opportunity_status(db, opportunity_id, "failed")
                 return ExecutionResult(success=False, trades=[], error="Missing token IDs for live order")
 
+            # FOK sequencing + auto-unwind, same as binary: place each outcome leg
+            # fill-or-kill in order; if any leg kills, flatten the legs already filled.
             client = self.order_client()
-            placed = []
+            filled_legs = []
             try:
                 for outcome, price in prices.items():
                     res = await client.place_order(
                         private_key=private_key, token_id=token_ids[outcome],
-                        side="buy", price=price, size=shares, tif="GTC",
+                        side="buy", price=price, size=shares, tif="FOK",
                     )
-                    if not res.success:
-                        # Any leg failing to place -> cancel all placed legs so we
-                        # never hold an incomplete (unhedged) multi-outcome basket.
-                        for oid in placed:
-                            await client.cancel_order(private_key, oid)
-                        await queries.update_opportunity_status(db, opportunity_id, "failed")
+                    if not (res.success and res.status == "filled"):
+                        await self._unwind_legs(db, user_id, config, opportunity_id, filled_legs, "multi_outcome")
+                        status = "partial" if filled_legs else "failed"
+                        await queries.update_opportunity_status(db, opportunity_id, status)
                         return ExecutionResult(
-                            success=False, trades=[], partial_fill=True,
-                            error=f"Outcome {outcome} failed to place: {res.error}",
+                            success=False, trades=[], partial_fill=bool(filled_legs),
+                            error=f"Outcome {outcome} FOK killed; unwound {len(filled_legs)} filled leg(s)",
                         )
-                    if res.order_id:
-                        placed.append(res.order_id)
+                    fill_price = res.fill_price if res.fill_price is not None else price
+                    filled_legs.append((outcome, token_ids[outcome], shares, fill_price))
                     trade = await queries.create_trade(
                         db,
                         user_id=user_id,
@@ -442,10 +487,10 @@ class ExecutionEngine:
                         strategy_type="multi_outcome",
                         side=outcome,
                         size_usdc=Decimal(str(per_leg_cost[outcome])),
-                        fill_price=Decimal(str(price)),
+                        fill_price=Decimal(str(fill_price)),
                         filled_size=Decimal(str(res.filled_size)),
                         fees_paid=Decimal(str(fee_per_leg)),
-                        status=res.status,
+                        status="filled",
                         is_paper=False,
                         order_id=res.order_id,
                         tx_hash=res.tx_hash,
@@ -456,8 +501,7 @@ class ExecutionEngine:
                 await queries.update_opportunity_status(db, opportunity_id, "executed", executed_at=now)
             except Exception as e:
                 logger.error(f"Failed to execute multi-outcome arb: {e}")
-                for oid in placed:
-                    await client.cancel_order(private_key, oid)
+                await self._unwind_legs(db, user_id, config, opportunity_id, filled_legs, "multi_outcome")
                 await queries.update_opportunity_status(db, opportunity_id, "failed")
                 return ExecutionResult(success=False, trades=[], error=str(e))
 
@@ -465,6 +509,25 @@ class ExecutionEngine:
             success=True,
             trades=[{"id": str(t.id), "side": t.side, "status": t.status} for t in trades],
         )
+
+    async def _check_position_caps(self, db, user_id, settings, token_id, add_notional) -> Optional[str]:
+        """
+        Enforce position limits on a new opening buy: a global cap on the number of
+        concurrent open positions, and a per-token notional cap. Returns an error
+        string if the buy would breach a cap, else None.
+        """
+        positions = await queries.get_open_positions(db, user_id)
+        max_open_global = settings.get("max_open_positions_global", 20)
+        if token_id not in positions and len(positions) >= max_open_global:
+            return f"Global open-position cap reached: {len(positions)} >= {max_open_global}"
+
+        max_pos_usdc = settings.get("max_position_usdc", 200.0)
+        existing = positions.get(token_id)
+        existing_notional = (existing["qty"] * existing["avg_entry_price"]) if existing else 0.0
+        if existing_notional + add_notional > max_pos_usdc:
+            return (f"Per-position cap reached for token: "
+                    f"${existing_notional:.2f} + ${add_notional:.2f} > ${max_pos_usdc:.2f}")
+        return None
 
     async def execute_strategy_intent(
         self,
@@ -493,6 +556,8 @@ class ExecutionEngine:
         # so they must still honor the kill switch but not the capital/budget caps.
         if is_buy:
             risk_error = await self.check_risk_limits(db, user_id, config, notional)
+            if not risk_error:
+                risk_error = await self._check_position_caps(db, user_id, settings, intent.token_id, notional)
         else:
             risk_error = None if settings.get("bot_active", False) else "Bot is not active (kill switch may be engaged)"
         if risk_error:

@@ -291,6 +291,28 @@ class TestExecuteStrategyIntent:
         assert len(store["trades"]) == 0
         assert "No position" in res.error
 
+    def test_global_open_position_cap_blocks_new_buy(self, monkeypatch):
+        positions = {f"t{i}": {"qty": 1.0, "avg_entry_price": 0.5} for i in range(20)}  # at cap (20)
+        store = {"claimed": set(), "trades": [], "opp_status": {}, "positions": positions}
+        _install_exec_fakes(monkeypatch, store)
+        eng = ExecutionEngine(polymarket=SimpleNamespace())
+        intent = StrategyIntent(str(uuid4()), "m", "c", "tokNEW", "YES", "buy", 100.0, 0.25, "entry")
+        res = asyncio.run(eng.execute_strategy_intent(SimpleNamespace(), uuid4(), _paper_cfg(), intent, uuid4()))
+        assert res.success is False
+        assert "cap" in res.error.lower()
+        assert len(store["trades"]) == 0
+
+    def test_per_token_notional_cap_blocks_buy(self, monkeypatch):
+        # token already at $200 notional (the default per-position cap)
+        store = {"claimed": set(), "trades": [], "opp_status": {},
+                 "positions": {"tok": {"qty": 400.0, "avg_entry_price": 0.5}}}
+        _install_exec_fakes(monkeypatch, store)
+        eng = ExecutionEngine(polymarket=SimpleNamespace())
+        intent = StrategyIntent(str(uuid4()), "m", "c", "tok", "YES", "buy", 200.0, 0.25, "entry")
+        res = asyncio.run(eng.execute_strategy_intent(SimpleNamespace(), uuid4(), _paper_cfg(), intent, uuid4()))
+        assert res.success is False
+        assert "cap" in res.error.lower()
+
     def test_non_crossing_limit_rests_unfilled(self, monkeypatch):
         # A buy limit that does not cross the book must NOT book a fill in paper
         store = {"claimed": set(), "trades": [], "opp_status": {}, "positions": {}}

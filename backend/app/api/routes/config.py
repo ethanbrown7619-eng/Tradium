@@ -77,11 +77,14 @@ async def kill_switch(
     if not config:
         raise HTTPException(status_code=404, detail="Config not found")
 
-    settings = dict(config.settings)
     if body.activate:
-        settings["bot_active"] = False
-    else:
-        settings["bot_active"] = True
+        # Full hard stop: cancel_all orders, cancel open trades/opportunities, halt.
+        from app.bot.safety import engage_kill_switch
+        result = await engage_kill_switch(db, config)
+        return {"bot_active": False, "kill_switch_activated": True, **result}
 
-    await queries.update_user_config(db, user.id, settings=settings)
-    return {"bot_active": not body.activate, "kill_switch_activated": body.activate}
+    # Deactivate = manual restart (clears the kill-switch stamp, re-enables the bot)
+    settings = dict(config.settings)
+    settings["bot_active"] = True
+    await queries.update_user_config(db, user.id, settings=settings, kill_switch_activated_at=None)
+    return {"bot_active": True, "kill_switch_activated": False}

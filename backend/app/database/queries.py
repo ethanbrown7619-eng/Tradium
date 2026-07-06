@@ -190,6 +190,35 @@ async def get_trades(
     return list(result.scalars().all())
 
 
+async def cancel_open_opportunities(session: AsyncSession, user_id: UUID) -> int:
+    """Cancel all of a user's still-open opportunities (kill switch)."""
+    result = await session.execute(
+        update(Opportunity)
+        .where(and_(
+            Opportunity.user_id == user_id,
+            Opportunity.status.in_(["pending", "queued", "executing"]),
+        ))
+        .values(status="cancelled")
+    )
+    await session.commit()
+    return result.rowcount
+
+
+async def cancel_open_trades(session: AsyncSession, user_id: UUID) -> int:
+    """Mark a user's working LIVE order trades cancelled (kill switch)."""
+    result = await session.execute(
+        update(Trade)
+        .where(and_(
+            Trade.user_id == user_id,
+            Trade.is_paper == False,  # noqa: E712
+            Trade.status.in_(["submitted", "partial", "open"]),
+        ))
+        .values(status="cancelled")
+    )
+    await session.commit()
+    return result.rowcount
+
+
 async def get_open_order_trades(session: AsyncSession, limit: int = 500) -> list[Trade]:
     """Live trades whose orders are still working (submitted/partial) — for fill polling."""
     result = await session.execute(

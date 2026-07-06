@@ -55,6 +55,8 @@ class UserConfig(Base):
         "max_daily_loss": 50.0,
         "max_trades_per_hour": 20,
         "cooldown_after_fail": 60,
+        "max_position_usdc": 200.0,          # cap per open token position (strategy)
+        "max_open_positions_global": 20,     # cap on total concurrent open positions
         "notify_email": None,
         "notify_on_trade": True,
         "notify_on_opportunity": False,
@@ -63,6 +65,7 @@ class UserConfig(Base):
         "notify_on_kill_switch": True,
     })
 
+    kill_switch_activated_at = Column(DateTime(timezone=True), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     user = relationship("User", back_populates="config")

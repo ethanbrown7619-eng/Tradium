@@ -67,13 +67,16 @@ class TestAssessHedge:
 class FakeOrderClient:
     def __init__(self, place_results=None, get_result=None):
         self.place_results = place_results or {}   # token_id -> OrderResult
-        self.default_place = OrderResult(success=True, order_id="ok", status="submitted")
+        # FOK success = fully filled
+        self.default_place = OrderResult(success=True, order_id="ok", status="filled", filled_size=1.0)
         self.get_result = get_result
         self.cancelled = []
-        self.placed = []
+        self.placed = []          # (token_id, side) tuples
+        self.placed_tokens = []   # token_ids only (back-comfrom convenience)
 
     async def place_order(self, private_key, token_id, side, price, size, tif="GTC"):
-        self.placed.append(token_id)
+        self.placed.append((token_id, side))
+        self.placed_tokens.append(token_id)
         return self.place_results.get(token_id, self.default_place)
 
     async def cancel_order(self, private_key, order_id):
@@ -140,38 +143,47 @@ def _patch_live_helpers(monkeypatch):
     monkeypatch.setattr(ExecutionEngine, "_reverify_binary", ok_reverify)
 
 
+class _PM:
+    """Polymarket stub exposing get_order_book for the unwind path."""
+    async def get_order_book(self, token_id):
+        return {"bids": [{"price": "0.44", "size": "100000"}], "asks": []}
+
+
 class TestLiveBinaryExecution:
     def test_both_legs_placed_with_real_token_ids(self, monkeypatch):
         store = {"claimed": set(), "trades": [], "opp_status": {}}
         _install_min_fakes(monkeypatch, store)
         _patch_live_helpers(monkeypatch)
-        fake = FakeOrderClient()
-        eng = ExecutionEngine(polymarket=SimpleNamespace(), order_client=fake)
+        fake = FakeOrderClient()  # default = FOK filled
+        eng = ExecutionEngine(polymarket=_PM(), order_client=fake)
 
         res = asyncio.run(eng.execute_binary_arbitrage(
             SimpleNamespace(), uuid4(), _live_cfg(), _binary_opp(), uuid4()))
         assert res.success is True
-        # placed against the REAL token ids, not condition_id+"_yes"
-        assert set(fake.placed) == {"tok_yes", "tok_no"}
+        # both legs bought against the REAL token ids as FOK
+        assert set(fake.placed_tokens) == {"tok_yes", "tok_no"}
+        assert ("tok_yes", "buy") in fake.placed and ("tok_no", "buy") in fake.placed
         assert len(store["trades"]) == 2
 
-    def test_second_leg_failure_cancels_first_leg(self, monkeypatch):
+    def test_killed_second_leg_unwinds_first_leg(self, monkeypatch):
         store = {"claimed": set(), "trades": [], "opp_status": {}}
         _install_min_fakes(monkeypatch, store)
         _patch_live_helpers(monkeypatch)
-        # YES places fine (order id yes1); NO fails to place
+        opp_id = uuid4()
+        # YES fills FOK; NO killed. Unwind must SELL tok_yes to flatten.
         fake = FakeOrderClient(place_results={
-            "tok_yes": OrderResult(success=True, order_id="yes1", status="submitted"),
-            "tok_no": OrderResult(success=False, status="failed", error="rejected"),
+            "tok_yes": OrderResult(success=True, order_id="yes1", status="filled", filled_size=1.0),
+            "tok_no": OrderResult(success=False, status="failed", error="FOK killed"),
         })
-        eng = ExecutionEngine(polymarket=SimpleNamespace(), order_client=fake)
+        eng = ExecutionEngine(polymarket=_PM(), order_client=fake)
 
         res = asyncio.run(eng.execute_binary_arbitrage(
-            SimpleNamespace(), uuid4(), _live_cfg(), _binary_opp(), uuid4()))
+            SimpleNamespace(), uuid4(), _live_cfg(), _binary_opp(), opp_id))
         assert res.success is False
         assert res.partial_fill is True
-        # The already-placed YES order must be cancelled — never hold one naked leg
-        assert "yes1" in fake.cancelled
+        # Auto-unwind: a SELL was placed on the filled YES leg — never left naked
+        assert ("tok_yes", "sell") in fake.placed
+        assert store["opp_status"][opp_id] == "partial"
 
 
 # ── VWAP re-verify rejection ──
